@@ -11,8 +11,9 @@
 //
 // 使い方: obs-host <設定の JSON>（Config を参照）
 // 標準入力: 1 行 1 つの JSON 命令。{"cmd":"target","exe":"Discovery.exe"}（null でゲームなし）。閉じたら止めて終わる
-// 標準出力: 1 行 1 つの JSON。{"event":"started"} / {"event":"hooked","exe":...} / {"event":"unhooked"} /
+// 標準出力: 1 行 1 つの JSON。{"event":"started"} / {"event":"capturing","wallMs":...}（フレームを受け取り始めた時刻） / {"event":"hooked","exe":...} / {"event":"unhooked"} /
 //           {"event":"mic","name":...} / {"event":"lagging","lagged":n,"total":n} / {"event":"error","message":...}
+//           {"event":"detect","type":"kill",...}（画面認識。Detector.cs）/ Bench のとき {"event":"detect_stats",...} {"event":"host_stats",...}
 // 標準エラー: OBS のログ（警告以上と、ゲームキャプチャの状態）
 
 using System.Diagnostics;
@@ -198,6 +199,11 @@ var outSettings = Obs.Data(d =>
 var output = Obs.obs_output_create("ffmpeg_output", "ring", outSettings, IntPtr.Zero);
 Obs.obs_data_release(outSettings);
 Obs.obs_output_set_mixers(output, separate ? 0b111u : 1u);
+// 出力が実際にフレームを受け取り始めた瞬間（ffmpeg_output は初期化を別スレッドで済ませてから始める）。
+// この時刻が区切りの CSV の 0 秒にあたるので、アプリ側の録画開始の絶対時刻（RingRecorder.t0）にする。
+// CSV に最初の行が出た時刻から逆算すると、FFmpeg が入力を調べる間のぶん（数秒）遅れることがある
+Obs.SignalCallback onCapturing = (_, _) => Emit(new { @event = "capturing", wallMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() });
+Obs.signal_handler_connect(Obs.obs_output_get_signal_handler(output), "start", onCapturing, IntPtr.Zero);
 if (!Obs.obs_output_start(output))
 {
     var err = Obs.Str(Obs.obs_output_get_last_error(output));
@@ -205,6 +211,9 @@ if (!Obs.obs_output_start(output))
     return Fail($"could not start OBS output: {err}");
 }
 Emit(new { @event = "started" });
+// 画面認識（Detector.cs）。対象ゲームが動いている間だけ照合する
+var detector = config.Detect == null || config.Detect.Profiles.Length == 0 ? null
+    : new Detector(config.Detect, config.OutputWidth, config.OutputHeight, config.Fps, config.Target, config.Bench, Emit);
 
 // ---- 命令（標準入力）と見張り ----
 string? target = config.Target;
@@ -219,7 +228,11 @@ var commandThread = new Thread(() =>
         try
         {
             var cmd = JsonNode.Parse(line);
-            if ((string?)cmd?["cmd"] == "target") lock (stdoutLock) target = (string?)cmd["exe"];
+            if ((string?)cmd?["cmd"] == "target")
+            {
+                lock (stdoutLock) target = (string?)cmd["exe"];
+                detector?.SetTarget((string?)cmd["exe"]);
+            }
         }
         catch (Exception e) { Console.Error.WriteLine($"bad command: {e.Message}"); }
     }
@@ -229,6 +242,10 @@ commandThread.Start();
 
 uint lastLagged = Obs.obs_get_lagged_frames();
 var lagCheck = Stopwatch.StartNew();
+var benchCheck = Stopwatch.StartNew();
+var benchCpu = Process.GetCurrentProcess().TotalProcessorTime;
+uint benchLagged = lastLagged, benchTotal = Obs.obs_get_total_frames();
+int benchDropped = 0;
 var sinceStart = Stopwatch.StartNew();
 bool wasActive = false;
 int tick = 0;
@@ -278,9 +295,34 @@ while (!stopping)
         lastLagged = lagged;
         lagCheck.Restart();
     }
+
+    // 計測用: 認識あり・なしで比べるための obs-host 全体の負荷（10 秒ごと）
+    if (config.Bench && benchCheck.Elapsed.TotalSeconds >= 10)
+    {
+        double sec = benchCheck.Elapsed.TotalSeconds;
+        var cpu = Process.GetCurrentProcess().TotalProcessorTime;
+        uint lagged = Obs.obs_get_lagged_frames(), total = Obs.obs_get_total_frames();
+        int dropped = Obs.obs_output_get_frames_dropped(output);
+        Emit(new
+        {
+            @event = "host_stats",
+            detect = detector != null,
+            seconds = Math.Round(sec, 1),
+            cpuPct = Math.Round((cpu - benchCpu).TotalMilliseconds / (sec * 1000) * 100, 1), // 論理コア 1 つ = 100%
+            cores = Environment.ProcessorCount,
+            frames = total - benchTotal,
+            lagged = lagged - benchLagged,
+            dropped = dropped - benchDropped,
+            hooked,
+        });
+        benchCpu = cpu; benchLagged = lagged; benchTotal = total; benchDropped = dropped;
+        benchCheck.Restart();
+    }
 }
 
 // ---- 後片付け ----
+GC.KeepAlive(onCapturing);
+detector?.Dispose();
 Obs.obs_output_stop(output);
 for (int i = 0; i < 50 && Obs.obs_output_active(output); i++) Thread.Sleep(100);
 Obs.obs_output_release(output);
@@ -315,4 +357,4 @@ record Config(
     string ObsDir, string Ffmpeg, string OutDir, double SegmentSec, int Wrap,
     int Fps, int BaseWidth, int BaseHeight, int OutputWidth, int OutputHeight,
     MonitorPos Monitor, float SdrWhiteNits, string Encoder, string EncoderSettings,
-    string? Target, AudioConfig Audio);
+    string? Target, AudioConfig Audio, DetectConfig? Detect = null, bool Bench = false);

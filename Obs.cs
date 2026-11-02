@@ -108,6 +108,9 @@ static class Obs
     [DllImport(Lib)] [return: MarshalAs(UnmanagedType.U1)]
     public static extern bool obs_output_active(IntPtr output);
     [DllImport(Lib)] public static extern IntPtr obs_output_get_last_error(IntPtr output);
+    [DllImport(Lib)] public static extern IntPtr obs_output_get_signal_handler(IntPtr output);
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)] public delegate void SignalCallback(IntPtr data, IntPtr calldata);
+    [DllImport(Lib, CharSet = CharSet.Ansi)] public static extern void signal_handler_connect(IntPtr handler, string signal, SignalCallback callback, IntPtr data);
     [DllImport(Lib)] public static extern int obs_output_get_frames_dropped(IntPtr output);
 
     // ログ: void (*log_handler_t)(int lvl, const char *msg, va_list args, void *p)
